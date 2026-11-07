@@ -1,0 +1,11 @@
+__pycache__/
+*.py[cod]
+.venv/
+*.egg-info/
+build/
+dist/
+.pytest_cache/
+docs/PLAN_FOR_CLAUDE_REVIEW.zh-CN.md
+docs/CLAUDE_REVIEW_AND_DECISIONS.zh-CN.md
+docs/PROGRESS.zh-CN.md
+docs/evidence/
