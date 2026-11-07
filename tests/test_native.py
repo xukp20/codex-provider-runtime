@@ -16,6 +16,7 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'experiments'))
 from mock_responses import MockResponses
+from codex_provider_runtime.runtime import private_socket_directory
 
 
 BINARY = os.environ.get('CPR_TEST_BINARY')
@@ -25,6 +26,11 @@ pytestmark = pytest.mark.skipif(not BINARY, reason='Set CPR_TEST_BINARY for isol
 class NativeFixture:
     def __init__(self, root, mock):
         self.root, self.mock = root, mock
+        self.app = None
+        self.log = None
+        # Native Windows AF_UNIX rejects the inherited Temp directory ACL.
+        # Only this disposable fixture directory is made private.
+        private_socket_directory(root)
         self.home = root / 'home'
         self.home.mkdir()
         self.sock = root / 'app.sock'
@@ -33,6 +39,9 @@ class NativeFixture:
                     'PYTHONPATH': str(Path(__file__).resolve().parents[1] / 'src')}
         self.env.pop('CODEX_APP_SERVER_SOCKET', None)
         self.env.pop('CPR_FORCE_PROXY', None)
+        for name in ('CODEX_SQLITE_HOME', 'CODEX_API_KEY', 'CODEX_ACCESS_TOKEN',
+                     'OPENAI_API_KEY', 'OPENAI_BASE_URL'):
+            self.env.pop(name, None)
         self.argv = [sys.executable, '-m', 'codex_provider_runtime.cli', '--home', str(self.home),
                      '--binary', BINARY, '--app-socket', str(self.sock)]
         self.home.joinpath('config.toml').write_text(f'''model="gpt-6.1-sol"
@@ -52,9 +61,12 @@ wire_api="responses"
 experimental_bearer_token="local-fixture-only-b"
 ''')
         self.log = root.joinpath('app.log').open('wb')
+        process_options = ({'creationflags': subprocess.CREATE_NO_WINDOW |
+                            subprocess.CREATE_NEW_PROCESS_GROUP} if os.name == 'nt'
+                           else {'start_new_session': True})
         self.app = subprocess.Popen([BINARY, 'app-server', '--listen', 'unix://' + str(self.sock)],
                                     env=self.env, stdin=subprocess.DEVNULL,
-                                    stdout=self.log, stderr=self.log, start_new_session=True)
+                                    stdout=self.log, stderr=self.log, **process_options)
         deadline = time.monotonic() + 20
         while time.monotonic() < deadline:
             assert self.app.poll() is None, root.joinpath('app.log').read_text()
@@ -98,17 +110,19 @@ experimental_bearer_token="local-fixture-only-b"
                     process.wait(10)
             except (KeyError, psutil.Error):
                 pass
-        if self.app.poll() is None:
+        if self.app is not None and self.app.poll() is None:
             self.app.terminate()
             self.app.wait(10)
-        self.log.close()
+        if self.log is not None:
+            self.log.close()
 
 
 @pytest.fixture
 def native():
     with tempfile.TemporaryDirectory(prefix='cpr-native-') as directory, MockResponses() as mock:
-        fixture = NativeFixture(Path(directory), mock)
+        fixture = NativeFixture.__new__(NativeFixture)
         try:
+            fixture.__init__(Path(directory), mock)
             yield fixture
         finally:
             fixture.cleanup()
@@ -171,6 +185,11 @@ def test_native_creation_routing_names_and_receipts(native):
 
 def test_native_disconnect_interrupt_and_auto_ensure_external(native):
     thread = native.create('Slow native')
+    before = len(native.mock.requests)
+    missing_sender = native.call('--external', 'send', '--thread', thread['threadId'],
+                                 '--message', 'SHOULD_NOT_SEND', expected=1)
+    assert 'sender attribution' in missing_sender['error']
+    assert len(native.mock.requests) == before
     sent = native.call('send', '--thread', thread['threadId'], '--message', 'SLOW_E1')
     # The send CLI has exited, leaving no subscriber; the owned native daemon continues.
     done = native.call('wait', '--thread', thread['threadId'], '--turn', sent['turnId'], '--timeout', '10')
@@ -182,9 +201,16 @@ def test_native_disconnect_interrupt_and_auto_ensure_external(native):
     interrupted = native.call('wait', '--thread', thread['threadId'], '--turn', second['turnId'], '--timeout', '10', expected=4)
     assert interrupted['status'] == 'interrupted'
     native.call('server', 'stop', '--provider', 'fixture-b')
-    started = native.call('send', '--thread', thread['threadId'], '--message', 'SHORT EXTERNAL', '--wait', '--timeout', '10', external=True)
+    started = native.call('send', '--thread', thread['threadId'], '--message', 'SHORT EXTERNAL',
+                          '--request-id', 'native-external', '--wait', '--timeout', '10', external=True)
     assert started['status'] == 'completed' and started['provider'] == 'fixture-b'
     assert '[From pytest, an external agent, via codex-provider-runtime.]' in json.dumps(native.mock.last_body)
+    before_conflict = len(native.mock.requests)
+    sender_conflict = native.call('--external', '--sender', 'different sender', 'send',
+                                  '--thread', thread['threadId'], '--message', 'SHORT EXTERNAL',
+                                  '--request-id', 'native-external', expected=1)
+    assert 'different operation' in sender_conflict['error']
+    assert len(native.mock.requests) == before_conflict, 'Sender conflict performed inference'
     assert native.app.poll() is None
 
 

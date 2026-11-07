@@ -4,6 +4,7 @@ import importlib.util
 import json
 import os
 from pathlib import Path
+import socket
 import tempfile
 import unittest
 from unittest.mock import patch
@@ -13,9 +14,12 @@ from websockets.legacy.server import unix_serve
 from codex_provider_runtime.transport import Rpc, RpcError, TransportError
 
 
-BINARY = Path('/root/.cache/codex-provider-runtime/toolchains/0.167.0/codex')
+BINARY = Path(os.environ.get('CPR_TEST_BINARY') or
+              '/root/.cache/codex-provider-runtime/toolchains/0.167.0/codex')
+UNIX_FIXTURE = os.name != 'nt' and hasattr(socket, 'AF_UNIX')
 
 
+@unittest.skipUnless(UNIX_FIXTURE, 'Python Unix server fixture unavailable; native integration covers Windows proxy')
 class RpcTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
         self.temporary = tempfile.TemporaryDirectory(prefix='cpr-transport-')
@@ -131,7 +135,8 @@ class RpcTests(unittest.IsolatedAsyncioTestCase):
                 pass
 
 
-@unittest.skipUnless(BINARY.is_file() and importlib.util.find_spec('wsproto'), 'native proxy binary and wsproto required')
+@unittest.skipUnless(UNIX_FIXTURE and BINARY.is_file() and importlib.util.find_spec('wsproto'),
+                     'Python Unix server fixture and native proxy binary required')
 class ProxyRpcTests(RpcTests):
     async def asyncSetUp(self):
         await super().asyncSetUp()

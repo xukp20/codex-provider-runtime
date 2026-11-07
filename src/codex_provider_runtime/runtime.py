@@ -32,6 +32,11 @@ def discover_binary(explicit: str | None = None) -> str:
         return str(Path(found).absolute())
     # Prefer the App's actual bundled native daemon on Windows over an older PATH CLI.
     if os.name == "nt":
+        home = Path(os.environ.get("CODEX_HOME") or Path.home()/".codex")
+        daemons = sorted(home.glob("packages/app-server-daemon/releases/*/bin/codex.exe"),
+                         key=lambda p: p.stat().st_mtime, reverse=True)
+        if daemons:
+            return str(daemons[0])
         root = Path(os.environ.get("LOCALAPPDATA", ""))
         found = sorted(root.glob("OpenAI/Codex/**/codex.exe"), key=lambda p: p.stat().st_mtime, reverse=True)
         if found:
