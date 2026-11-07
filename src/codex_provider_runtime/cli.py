@@ -199,10 +199,12 @@ def main(argv=None):
     args = parser().parse_args(argv)
     try:
         result = asyncio.run(run(args))
-        print(json.dumps(result, ensure_ascii=False, indent=2))
+        # ASCII JSON survives Windows legacy console encodings; JSON decoders
+        # recover the original Unicode titles, messages and paths exactly.
+        print(json.dumps(result, ensure_ascii=True, indent=2))
         return status_code(result)
     except (RuntimeFailure, RpcError, TransportError, OSError, ValueError, TimeoutError) as error:
-        print(json.dumps({"error": str(error), "errorType": type(error).__name__}, ensure_ascii=False), file=sys.stderr)
+        print(json.dumps({"error": str(error), "errorType": type(error).__name__}, ensure_ascii=True), file=sys.stderr)
         return 1
     except KeyboardInterrupt:
         print(json.dumps({"error": "Client interrupted; native task may still be running. Read before resending."}), file=sys.stderr)

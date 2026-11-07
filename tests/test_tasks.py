@@ -76,3 +76,29 @@ def test_owned_process_identity_cannot_be_a_pid_only():
 
 def test_terminal_exit_codes():
     assert [status_code({"status": s}) for s in ["completed", "failed", "interrupted", "timeout", "waitingForInput"]] == [0, 3, 4, 5, 6]
+
+
+def test_json_error_roundtrips_unicode_in_gbk_console(tmp_path):
+    import os
+    import subprocess
+    import sys
+    missing = tmp_path/"不存在\u00a0\U0001f9ea.txt"
+    result = subprocess.run([sys.executable, "-m", "codex_provider_runtime.cli", "send", "--thread", "unused",
+        "--message-file", str(missing)], capture_output=True,
+        env={**os.environ, "PYTHONIOENCODING": "gbk"})
+    assert result.returncode == 1
+    error = json.loads(result.stderr.decode("ascii"))["error"]
+    assert "不存在" in error and "\U0001f9ea" in error
+
+
+def test_json_result_roundtrips_unicode_in_gbk_console():
+    import io
+    from unittest.mock import patch
+    from codex_provider_runtime import cli
+    buffer = io.BytesIO()
+    stream = io.TextIOWrapper(buffer, encoding="gbk")
+    result = {"name": "中文\u00a0\U0001f9ea"}
+    with patch.object(cli, "run", AsyncMock(return_value=result)), patch.object(cli.sys, "stdout", stream):
+        assert cli.main(["doctor"]) == 0
+        stream.flush()
+        assert json.loads(buffer.getvalue().decode("ascii")) == result
