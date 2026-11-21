@@ -1,6 +1,6 @@
-# GPT-6 Astra
+# GPT-6.2 Astra
 
-Default: `gpt-6-astra`, `medium`. The user division document and explicit task choices take precedence. This records user working preferences, not measured superiority or pricing.
+Default: `gpt-6.2-astra`, `medium`. The user division document and explicit task choices take precedence. This records user working preferences, not measured superiority or pricing.
 
 Use astra for a concentrated question that requires independent judgment: an unresolved design, interacting constraints, difficult tradeoffs, contradictory evidence or an important independent assessment. Keep sol as the main workhorse for routine execution and iteration.
 

@@ -1,6 +1,6 @@
-# GPT-6.1 Sol
+# GPT-6.2 Sol
 
-Default: `gpt-6.1-sol`, `high`. The user division document and explicit task choices take precedence. This is assignment guidance, not a registered role or a capacity benchmark.
+Default: `gpt-6.2-sol`, `high`. The user division document and explicit task choices take precedence. This is assignment guidance, not a registered role or a capacity benchmark.
 
 Use sol for most analysis, implementation, diagnosis, research synthesis and review. Give the objective, settled decisions, relevant consumers, writable scope and observable verification. Permit ordinary implementation choices while identifying material boundary decisions.
 

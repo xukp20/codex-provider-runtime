@@ -35,7 +35,7 @@ Stop applies only to an owned service whose recorded process identity still matc
 ## Create, fork and resume
 
 ```bash
-python scripts/run.py create --provider PROVIDER_ID --title "Review" --cwd /absolute/project --model gpt-6.1-sol --effort high --context-window 100000 --auto-compact-token-limit 80000 --request-id CREATE_REQUEST_ID
+python scripts/run.py create --provider PROVIDER_ID --title "Review" --cwd /absolute/project --model gpt-6.2-sol --effort high --context-window 100000 --auto-compact-token-limit 80000 --request-id CREATE_REQUEST_ID
 python scripts/run.py fork --thread SOURCE_THREAD --provider TARGET_PROVIDER_ID --title "Experiment" --request-id FORK_REQUEST_ID
 python scripts/run.py resume --thread THREAD_ID --request-id RESUME_REQUEST_ID
 ```
