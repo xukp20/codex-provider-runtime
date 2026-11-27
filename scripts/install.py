@@ -157,7 +157,23 @@ def link_skill(home, name, target):
             remove_link(temporary)
 
 
-def install(source, codex_home, claude_home, target="both", python=sys.executable, skip_deps=False):
+def write_build_meta(source, stage):
+    metadata = tomllib.loads((stage / "pyproject.toml").read_text(encoding="utf-8"))
+    version = metadata.get("project", {}).get("version", "0.0.0")
+    commit = None
+    if (source / ".git").exists():
+        rev = subprocess.run(["git", "-C", str(source), "rev-parse", "--short", "HEAD"], capture_output=True, text=True)
+        if rev.returncode == 0:
+            commit = rev.stdout.strip() or None
+    meta = {
+        "version": version,
+        "gitCommit": commit,
+        "installedAtUtc": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+    }
+    (stage / "BUILD_META.json").write_text(json.dumps(meta, indent=2) + "\n", encoding="utf-8")
+
+
+def install(source, codex_home, claude_home, target="both", python=sys.executable, skip_deps=False, external_homes=None):
     source = Path(source).expanduser().resolve()
     selected = []
     for kind, home in (("codex", codex_home), ("claude", claude_home)):
@@ -166,8 +182,14 @@ def install(source, codex_home, claude_home, target="both", python=sys.executabl
         home = Path(home).expanduser().resolve()
         selected.append({"kind": kind, "home": home, "destination": home / "tool-sources" / NAME,
                          "skills": CODEX_SKILLS if kind == "codex" else ("codex-provider-external",)})
+    for idx, extra in enumerate(external_homes or [], start=1):
+        home = Path(extra).expanduser().resolve()
+        selected.append({"kind": f"external:{home.name or idx}", "home": home, "destination": home / "tool-sources" / NAME,
+                         "skills": ("codex-provider-external",)})
+    if not selected:
+        raise InstallError("No install targets selected; specify --target or --external-home")
     if len({item["home"] for item in selected}) != len(selected):
-        raise InstallError("Codex and Claude homes must be distinct")
+        raise InstallError("Install target homes must be distinct")
     for item in selected:
         destination = item["destination"]
         if exists(destination) and (is_link(destination) or not destination.is_dir()):
@@ -187,6 +209,7 @@ def install(source, codex_home, claude_home, target="both", python=sys.executabl
                 item["stage"] = stage
                 stages.append(stage)
                 copy_source(source, stage)
+                write_build_meta(source, stage)
             if not skip_deps:
                 install_dependencies(selected[0]["stage"], str(python))
                 for item in selected[1:]:
@@ -233,12 +256,14 @@ def main(argv=None):
     parser.add_argument("--source", type=Path, default=Path(__file__).resolve().parents[1])
     parser.add_argument("--codex-home", type=Path, default=Path(os.environ.get("CODEX_HOME", str(Path.home() / ".codex"))))
     parser.add_argument("--claude-home", type=Path, default=Path.home() / ".claude")
-    parser.add_argument("--target", choices=("codex", "claude", "both"), default="both")
+    parser.add_argument("--external-home", action="append", default=[], type=Path,
+                        help="Additional external agent home (e.g. ~/.gemini/config) to receive the runtime and external skill")
+    parser.add_argument("--target", choices=("codex", "claude", "both", "external"), default="both")
     parser.add_argument("--python", default=sys.executable)
     parser.add_argument("--skip-deps", action="store_true", help="Skip vendoring; tests or externally supplied dependency environments only")
     args = parser.parse_args(argv)
     try:
-        result = install(args.source, args.codex_home, args.claude_home, args.target, args.python, args.skip_deps)
+        result = install(args.source, args.codex_home, args.claude_home, args.target, args.python, args.skip_deps, args.external_home)
         print(json.dumps(result, indent=2))
         return 0
     except (InstallError, OSError, ValueError) as error:

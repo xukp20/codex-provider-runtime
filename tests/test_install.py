@@ -175,6 +175,18 @@ class InstallTests(unittest.TestCase):
         self.assertFalse((self.codex / 'tool-sources').exists())
         self.assertTrue(self.destination(self.claude).is_dir())
 
+    def test_external_home_installs_external_skill_and_build_meta(self):
+        gemini = self.root / 'gemini-config'
+        gemini.mkdir()
+        result = self.install(target='external', external_homes=[gemini])
+        self.assertEqual(len(result['installed']), 1)
+        self.assertFalse((self.codex / 'tool-sources').exists())
+        dest = self.destination(gemini)
+        self.assertTrue(dest.is_dir())
+        self.assertEqual(sorted(p.name for p in (gemini / 'skills').iterdir()), ['codex-provider-external'])
+        meta = json.loads((dest / 'BUILD_META.json').read_text(encoding='utf-8'))
+        self.assertIn('version', meta) and self.assertIn('installedAtUtc', meta)
+
     def test_dependency_command_vendors_and_redacts_pip_failure(self):
         stage = self.root / 'stage'
         stage.mkdir()

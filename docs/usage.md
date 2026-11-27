@@ -72,18 +72,60 @@ Wait results use these process exit codes:
 
 | Exit | Meaning |
 | --- | --- |
-| `0` | Completed or idle; also normal success for other operations. |
+| `0` | Completed or idle (single-thread mode); or events delivered (multi-target/inbox/marker mode); also normal success for other operations. |
 | `1` | Runtime, transport or native RPC error. |
-| `2` | Invalid command-line usage. |
-| `3` | Target turn failed. |
-| `4` | Target turn interrupted. |
+| `2` | Invalid command-line usage or duplicate `--consumer` lease conflict. |
+| `3` | Target turn failed (single-thread wait mode). |
+| `4` | Target turn interrupted (single-thread wait mode). |
 | `5` | Wait timed out. |
-| `6` | Waiting for input, including an unanswered native request. |
+| `6` | Waiting for input, including an unanswered native request (single-thread wait mode). |
 | `130` | This client was interrupted; the native task may still be running. |
 
 For reply delivery, inspect `sourceStatus` separately: its source turn may have failed or been interrupted even when delivering its result succeeds.
 
 The client does not approve or reject unknown native server-to-client requests automatically. If such a request prevents progress, report the waiting state accurately; do not claim completion.
+
+## Multi-target wait and structured inboxes
+
+External supervisors (such as AGY or Claude Code) and long-running multi-turn coordinators can multiplex N Codex threads across providers together with structured inbox channels in a single background `wait` process:
+
+```bash
+# Anchor the consumer cursor before dispatching work to prevent send-to-wait races
+python scripts/run.py --external --sender Antigravity send --thread THREAD_A --message "Start phase 1" --consumer agy-main --request-id REQ_1
+
+# Monitor multiple threads + an inbox channel in one command
+python scripts/run.py --external wait \
+  --thread THREAD_A --thread THREAD_B \
+  --inbox agy-coord --inbox-kind blocked --inbox-kind decision --inbox-kind done \
+  --wake-on-marker "::cpr:escalate" --wake-on-marker "::cpr:done" \
+  --consumer agy-main --timeout 0
+```
+
+Multi-target mode activates automatically whenever more than one thread/name is given or any of `--inbox`, `--wake-on-marker`, `--consumer`, `--idle-timeout`, or `--no-advance` is used. Single-thread `wait` without these options retains its original JSON shape and exit codes unchanged.
+
+Key behaviors in multi-target mode:
+
+- **Unified event delivery**: returns exit `0` with `status: "events"`, `worst` (`info` | `warning` | `error`), `events` (all ready events drained together), `threads` (status snapshot), and `cursor`. Non-zero exits are reserved for `wait` itself (`5` timeout, `2` usage/consumer conflict, `1` runtime error, `130` interrupted).
+- **Semantic markers (`--wake-on-marker`)**: scans only `agentMessage` items (never `userMessage`, `reasoning`, or command output) during active turns and at turn completion. Default `--marker-match line` matches markers at line start outside Markdown code fences (recommended prefix `::cpr:...`, e.g. `::cpr:escalate`); pass `--marker-match substring` for plain substring matching. Normal marker-less turn completions do not wake, while `failed`, `interrupted`, `waitingForInput`, and sustained endpoint disconnects always wake immediately.
+- **Persistent consumer cursor (`--consumer NAME`)**: stored under `$CODEX_HOME/provider-runtime/cursors/` with a non-blocking lease lock (concurrent waiters on the same consumer exit `2`). On wake, JSON is flushed to stdout before atomically advancing the cursor; use `--no-advance` for read-only inspection. Sticky error states are deduplicated by state transition so re-arming never loops infinitely.
+- **Idle watchdog (`--idle-timeout SECONDS`)**: optionally emits `thread_idle_timeout` if a watched thread stays continuously idle without starting a new turn.
+
+### Inbox commands
+
+Append-only JSONL channels live under `$CODEX_HOME/provider-runtime/inboxes/` with `FileLock` serialization, monotonic high-watermark sequence numbers, and zero-polling `AF_UNIX` DGRAM doorbells on Linux/POSIX (automatic stat-polling fallback on Windows):
+
+```bash
+# Push a mid-turn structured escalation (external callers must include --sender)
+python scripts/run.py inbox push --channel agy-coord --kind blocked --summary "Build failed on stage 2" --thread THREAD_A --phase B --details-path /abs/path/report.md --request-id PUSH_1
+
+# Inspect channel history or unread items for a consumer
+python scripts/run.py inbox list --channel agy-coord --consumer agy-main --unread-only --limit 20
+
+# Manually advance a consumer's inbox cursor (e.g. skip backlog before arming)
+python scripts/run.py inbox ack --channel agy-coord --consumer agy-main --latest
+```
+
+Ignored kinds (such as `progress` heartbeats when waiting with `--inbox-kind blocked`) remain persisted in the channel JSONL for audit via `inbox list` without waking the listener.
 
 ## Reply delivery
 

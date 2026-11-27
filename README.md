@@ -16,12 +16,12 @@ Command results and runtime errors emit JSON; standard help and usage errors rem
 
 The three skills are [codex-provider-tasks](skills/codex-provider-tasks/SKILL.md), [codex-provider-external](skills/codex-provider-external/SKILL.md), and [codex-delegation](skills/codex-delegation/SKILL.md). Codex uses all three; external agents use the external skill and the same implementation. Delegation reads the user's division document only when needed.
 
-Install self-contained source and dependencies for Codex and Claude:
+Install self-contained source and dependencies for Codex, Claude, and optional extra external agent homes (e.g. `~/.gemini/config`):
 
 ```bash
-python scripts/install.py --target both
+python scripts/install.py --target both --external-home ~/.gemini/config
 ```
 
-The installer links all three Codex skills and only the external Claude skill. Dependencies are vendored inside each home for backup; reinstall when changing platform or Python ABI. Existing source trees are retained as rollback copies. It does not change native Codex configuration or remove older tools.
+The installer links all three Codex skills and only the external skill for Claude and `--external-home` targets. Dependencies are vendored inside each home for backup; reinstall when changing platform or Python ABI. Existing source trees are retained as rollback copies. It does not change native Codex configuration or remove older tools.
 
-See [usage](docs/usage.md) for CLI operations and delivery semantics. Tested with native Codex 0.167.0 on Linux and Windows. Run `python -m pytest -q`; native integration tests additionally need `CPR_TEST_BINARY` pointing to a native Codex executable and use local mock providers only.
+See [usage](docs/usage.md) for CLI operations, delivery semantics, multi-target `wait` multiplexing, and structured `inbox` channels. Tested with native Codex 0.167.0 on Linux and Windows. Run `python -m pytest -q`; native integration tests additionally need `CPR_TEST_BINARY` pointing to a native Codex executable and use local mock providers only.

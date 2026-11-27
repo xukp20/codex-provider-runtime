@@ -1,7 +1,7 @@
 """Provider routing and native task operations shared by every sender."""
 from __future__ import annotations
 
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, suppress
 import asyncio
 import hashlib
 import json
@@ -12,6 +12,7 @@ import sys
 import time
 import uuid
 
+from .inbox import CursorStore, InboxDoorbell, InboxStore, match_markers, validate_name
 from .runtime import Endpoint, Runtime, RuntimeFailure
 from .state import FileLock, atomic_json, key, locked, read_json
 from .transport import RpcError, TransportError
@@ -19,6 +20,8 @@ from .transport import RpcError, TransportError
 
 TERMINAL = {"completed", "failed", "interrupted"}
 SOURCE_KINDS = ["cli", "vscode", "exec", "appServer", "subAgent", "subAgentReview", "subAgentCompact", "subAgentThreadSpawn", "subAgentOther", "unknown"]
+_INBOX_ERROR_KINDS = frozenset({"blocked", "error", "failed"})
+_INBOX_WARNING_KINDS = frozenset({"decision", "policy_decision", "warning", "escalation", "needs_input"})
 
 
 def text_input(text):
@@ -45,6 +48,18 @@ def active_turn(thread):
 class Tasks:
     def __init__(self, runtime: Runtime):
         self.runtime = runtime
+
+    @property
+    def _run_dir(self) -> Path:
+        return getattr(self.runtime, "run", self.runtime.state / "run")
+
+    @property
+    def inboxes(self) -> InboxStore:
+        return InboxStore(self.runtime.state, self._run_dir)
+
+    @property
+    def cursors(self) -> CursorStore:
+        return CursorStore(self.runtime.state, self._run_dir)
 
     async def catalogs(self):
         primary = await self.runtime.catalog()
@@ -152,6 +167,20 @@ class Tasks:
             if not cursor:
                 return rows
 
+    async def recent_turns(self, c, thread_id, *, stop_at=None, page_size=20, single_page=False):
+        """Fetch newest-first turns, stopping as soon as ``stop_at`` appears."""
+        rows, cursor = [], None
+        while True:
+            response = await c.request("thread/turns/list", {"threadId": thread_id, "limit": page_size,
+                "itemsView": "full", "cursor": cursor})
+            page = response.get("data", [])
+            rows.extend(page)
+            if single_page or (stop_at is not None and any(t.get("id") == stop_at for t in page)):
+                return rows
+            cursor = response.get("nextCursor")
+            if not cursor:
+                return rows
+
     def binding_path(self, thread):
         return self.runtime.state/"contexts"/(key(thread)+".json")
 
@@ -248,7 +277,34 @@ class Tasks:
         return {"threadId": row["id"], "provider": ep.provider, "model": result.get("model"),
             "effort": result.get("reasoningEffort"), "context": self.context(row["id"]), "created": True}
 
-    async def send(self, row, message, *, mode="followup", model=None, effort=None, message_id=None):
+    async def _anchor_consumer_before_send(self, c, thread_id, current, *, delivery, consumer):
+        if not consumer:
+            return
+        turns = current.get("turns", [])
+        if delivery == "steer" or (delivery == "queue" and active_turn(current)):
+            active = active_turn(current)
+            active_id = active["id"]
+            baseline = None
+            for idx, turn in enumerate(turns):
+                if turn.get("id") == active_id:
+                    baseline = turns[idx - 1]["id"] if idx > 0 else None
+                    break
+            recent = await self.recent_turns(c, thread_id, stop_at=active_id, page_size=5)
+            active_full = next((t for t in recent if t.get("id") == active_id), active)
+            seen_count = sum(1 for item in active_full.get("items", []) if item.get("type") == "agentMessage")
+            await self.cursors.anchor_thread(
+                consumer, thread_id, baseline_turn_id=baseline,
+                acked_state=None, seen_item_counts={active_id: seen_count},
+            )
+        else:
+            prev = turns[-1] if turns else None
+            baseline = prev["id"] if prev else None
+            acked = {"turnId": prev["id"], "status": prev.get("status")} if prev else None
+            await self.cursors.anchor_thread(
+                consumer, thread_id, baseline_turn_id=baseline, acked_state=acked,
+            )
+
+    async def send(self, row, message, *, mode="followup", model=None, effort=None, message_id=None, consumer=None):
         message_id = message_id or str(uuid.uuid4())
         async with self.connection(row, start=True) as (ep, c):
             await self._resume(c, row)
@@ -258,18 +314,23 @@ class Tasks:
             if delivery == "followup":
                 delivery = "start"
             if delivery == "queue":
+                if model or effort:
+                    raise RuntimeFailure("Native queue uses the thread model; change it in an idle start/resume first")
+                await self._anchor_consumer_before_send(c, row["id"], current, delivery="queue", consumer=consumer)
                 return await self._queue(ep, row, message, model, effort)
             if delivery == "steer":
                 if not active:
                     raise RuntimeFailure("Steer requires an active turn")
                 if model or effort:
                     raise RuntimeFailure("Steer cannot change model or effort; wait for idle and start")
+                await self._anchor_consumer_before_send(c, row["id"], current, delivery="steer", consumer=consumer)
                 response = await c.request("turn/steer", {"threadId": row["id"],
                     "expectedTurnId": active["id"], "input": text_input(message), "clientUserMessageId": message_id})
                 turn_id = response["turnId"]
             elif delivery == "start":
                 if active:
                     raise RuntimeFailure("Start requires an idle thread; use followup, steer or queue")
+                await self._anchor_consumer_before_send(c, row["id"], current, delivery="start", consumer=consumer)
                 params = {"threadId": row["id"], "input": text_input(message), "clientUserMessageId": message_id}
                 if model:
                     params["model"] = model
@@ -279,8 +340,11 @@ class Tasks:
                 turn_id = response["turn"]["id"]
             else:
                 raise RuntimeFailure("Unknown delivery mode")
-            return {"threadId": row["id"], "provider": ep.provider, "turnId": turn_id,
+            result = {"threadId": row["id"], "provider": ep.provider, "turnId": turn_id,
                 "delivery": delivery, "clientUserMessageId": message_id, "accepted": True}
+            if consumer:
+                result["consumerAnchored"] = consumer
+            return result
 
     async def _queue(self, ep, row, message, model, effort):
         if model or effort:
@@ -306,7 +370,7 @@ class Tasks:
             try:
                 async with self.connection(row) as (_, c):
                     while deadline is None or time.monotonic() < deadline:
-                        turns = await self.turns(c, row["id"])
+                        turns = await self.recent_turns(c, row["id"], stop_at=turn_id, single_page=turn_id is None)
                         if not turn_id:
                             # Native pages are newest-first.
                             if not turns:
@@ -327,6 +391,423 @@ class Tasks:
                 reconnect_error = str(error)
                 await asyncio.sleep(.5)
         return {"threadId": row["id"], "turnId": turn_id, "status": "timeout", "lastConnectionError": reconnect_error}
+
+    async def wait_multi(
+        self,
+        rows: list[dict],
+        *,
+        inboxes: list[str] | None = None,
+        inbox_kinds: list[str] | None = None,
+        markers: list[str] | None = None,
+        marker_mode: str = "line",
+        consumer: str | None = None,
+        no_advance: bool = False,
+        timeout: float = 3600,
+        idle_timeout: float = 0,
+        disconnect_grace: float = 15.0,
+        poll_interval: float = 0.5,
+        commit_callbacks: list | None = None,
+    ) -> dict:
+        unique_rows: list[dict] = []
+        seen_tids: set[str] = set()
+        for row in rows:
+            if row["id"] not in seen_tids:
+                seen_tids.add(row["id"])
+                unique_rows.append(row)
+        channels = list(dict.fromkeys(validate_name(ch, "channel") for ch in (inboxes or [])))
+        marker_list = [m for m in (markers or []) if m]
+        deadline = time.monotonic() + timeout if timeout else None
+
+        @asynccontextmanager
+        async def maybe_lease():
+            if consumer:
+                async with self.cursors.lease(consumer):
+                    yield
+            else:
+                yield
+
+        @asynccontextmanager
+        async def maybe_doorbell():
+            if channels:
+                async with InboxDoorbell(self._run_dir, self.runtime.state, channels) as bell:
+                    yield bell
+            else:
+                yield None
+
+        async with maybe_lease():
+            working_cursor = self.cursors.load(consumer) if consumer else {"consumer": None, "inboxes": {}, "threads": {}}
+            thread_states: dict[str, dict] = {}
+            for row in unique_rows:
+                tid = row["id"]
+                existing = working_cursor["threads"].get(tid)
+                if isinstance(existing, dict):
+                    state = {
+                        "baselineTurnId": existing.get("baselineTurnId"),
+                        "seenItemCounts": dict(existing.get("seenItemCounts") or {}),
+                        "ackedState": existing.get("ackedState"),
+                        "disconnected": bool(existing.get("disconnected", False)),
+                    }
+                else:
+                    state = {
+                        "_uninitialized": True,
+                        "baselineTurnId": None,
+                        "seenItemCounts": {},
+                        "ackedState": None,
+                        "disconnected": False,
+                    }
+                thread_states[tid] = state
+                working_cursor["threads"][tid] = state
+
+            events: list[dict] = []
+            seen_event_ids: set[str] = set()
+            thread_snapshots: dict[str, dict] = {}
+            idle_since: dict[str, tuple[float | None, str | None]] = {}
+            wake_event = asyncio.Event()
+
+            def add_event(event: dict):
+                if event["id"] not in seen_event_ids:
+                    seen_event_ids.add(event["id"])
+                    events.append(event)
+                    wake_event.set()
+
+            def remaining_time() -> float | None:
+                if deadline is None:
+                    return None
+                return max(0.0, deadline - time.monotonic())
+
+            def scan_inboxes() -> bool:
+                found = False
+                for ch in channels:
+                    cur_seq = int((working_cursor["inboxes"].get(ch) or {}).get("lastSeq") or 0)
+                    matched, high_seq = self.inboxes.read(ch, after_seq=cur_seq, kinds=inbox_kinds or None)
+                    if matched:
+                        for rec in matched:
+                            ikind = rec.get("kind", "info")
+                            if ikind in _INBOX_ERROR_KINDS:
+                                severity = "error"
+                            elif ikind in _INBOX_WARNING_KINDS:
+                                severity = "warning"
+                            else:
+                                severity = "info"
+                            ev = {
+                                "id": rec["id"],
+                                "source": "inbox",
+                                "kind": "inbox_message",
+                                "inboxKind": ikind,
+                                "severity": severity,
+                                "ts": rec["ts"],
+                                "channel": ch,
+                                "seq": rec["seq"],
+                                "summary": rec["summary"],
+                            }
+                            for opt in ("sender", "threadId", "phase", "detailsPath", "payload"):
+                                if opt in rec:
+                                    ev[opt] = rec[opt]
+                            add_event(ev)
+                            found = True
+                        working_cursor["inboxes"][ch] = {"lastSeq": max(cur_seq, high_seq)}
+                return found
+
+            def evaluate_thread(row: dict, turns: list[dict], pending_requests: dict, provider_thread_count: int):
+                tid = row["id"]
+                provider = row["modelProvider"]
+                state = thread_states[tid]
+                latest = turns[0] if turns else None
+                latest_id = latest["id"] if latest else None
+                latest_status = latest.get("status") if latest else "idle"
+                thread_snapshots[tid] = {"provider": provider, "status": latest_status, "latestTurnId": latest_id}
+
+                if state.pop("_uninitialized", False):
+                    if not turns:
+                        state["baselineTurnId"] = None
+                    elif latest_status == "inProgress":
+                        state["baselineTurnId"] = turns[1]["id"] if len(turns) > 1 else None
+                    elif consumer or marker_list:
+                        state["baselineTurnId"] = latest_id
+                        state["ackedState"] = {"turnId": latest_id, "status": latest_status}
+                    else:
+                        state["baselineTurnId"] = turns[1]["id"] if len(turns) > 1 else None
+
+                baseline = state.get("baselineTurnId")
+                newer: list[dict] = []
+                for turn in turns:
+                    if baseline is not None and turn.get("id") == baseline:
+                        break
+                    newer.append(turn)
+                candidates = list(reversed(newer))
+
+                matched_reqs = []
+                for req in pending_requests.values():
+                    req_tid = (req.get("params") or {}).get("threadId")
+                    if req_tid == tid or (req_tid is None and (latest_status == "inProgress" or provider_thread_count == 1)):
+                        matched_reqs.append({"id": req.get("id"), "method": req.get("method")})
+                if matched_reqs:
+                    req_sig = {"turnId": latest_id, "status": "waitingForInput", "requestIds": sorted(str(r["id"]) for r in matched_reqs)}
+                    if state.get("ackedState") != req_sig:
+                        add_event({
+                            "id": f"thr:{tid}:{latest_id or 'none'}:waiting:{','.join(req_sig['requestIds'])}",
+                            "source": "thread",
+                            "kind": "thread_waiting_for_input",
+                            "severity": "error",
+                            "ts": time.time(),
+                            "threadId": tid,
+                            "provider": provider,
+                            "turnId": latest_id,
+                            "summary": f"Thread waiting for input ({len(matched_reqs)} pending request(s))",
+                            "payload": {"requests": matched_reqs},
+                        })
+                        state["ackedState"] = req_sig
+
+                for turn in candidates:
+                    turn_id = turn["id"]
+                    status = turn.get("status")
+                    agent_msgs = [it for it in turn.get("items", []) if it.get("type") == "agentMessage"]
+                    if marker_list:
+                        seen_counts = state.setdefault("seenItemCounts", {})
+                        prev_count = int(seen_counts.get(turn_id, 0))
+                        for idx, item in enumerate(agent_msgs[prev_count:], start=prev_count):
+                            text = item.get("text", "")
+                            for hit_idx, (m_token, m_line) in enumerate(match_markers(text, marker_list, mode=marker_mode)):
+                                add_event({
+                                    "id": f"thr:{tid}:{turn_id}:item:{idx}:m:{hit_idx}",
+                                    "source": "thread",
+                                    "kind": "thread_marker",
+                                    "severity": "info",
+                                    "ts": time.time(),
+                                    "threadId": tid,
+                                    "provider": provider,
+                                    "turnId": turn_id,
+                                    "summary": m_line,
+                                    "payload": {"marker": m_token, "line": m_line, "text": text, "itemIndex": idx, "turnStatus": status},
+                                })
+                        seen_counts[turn_id] = len(agent_msgs)
+
+                    if status in {"failed", "interrupted"}:
+                        sig = {"turnId": turn_id, "status": status}
+                        if state.get("ackedState") != sig:
+                            add_event({
+                                "id": f"thr:{tid}:{turn_id}:{status}",
+                                "source": "thread",
+                                "kind": f"thread_{status}",
+                                "severity": "error",
+                                "ts": time.time(),
+                                "threadId": tid,
+                                "provider": provider,
+                                "turnId": turn_id,
+                                "summary": f"Turn {turn_id} {status}",
+                                "payload": {"turn": turn},
+                            })
+                            state["ackedState"] = sig
+                    elif status == "completed" and not marker_list:
+                        sig = {"turnId": turn_id, "status": "completed"}
+                        if state.get("ackedState") != sig:
+                            last_text = agent_msgs[-1].get("text", "") if agent_msgs else ""
+                            add_event({
+                                "id": f"thr:{tid}:{turn_id}:completed",
+                                "source": "thread",
+                                "kind": "thread_completed",
+                                "severity": "info",
+                                "ts": time.time(),
+                                "threadId": tid,
+                                "provider": provider,
+                                "turnId": turn_id,
+                                "summary": last_text[:200] if last_text else f"Turn {turn_id} completed",
+                                "payload": {"turn": turn},
+                            })
+                            state["ackedState"] = sig
+
+                    if status in TERMINAL:
+                        state["baselineTurnId"] = turn_id
+                        state.get("seenItemCounts", {}).pop(turn_id, None)
+
+                is_active = latest_status == "inProgress"
+                prev_idle = idle_since.get(tid)
+                if is_active:
+                    idle_since[tid] = (None, latest_id)
+                elif prev_idle is None or prev_idle[1] != latest_id or prev_idle[0] is None:
+                    idle_since[tid] = (time.monotonic(), latest_id)
+                elif idle_timeout > 0:
+                    elapsed = time.monotonic() - prev_idle[0]
+                    if elapsed >= idle_timeout:
+                        idle_sig = {"turnId": latest_id, "status": "idleTimeout"}
+                        if state.get("ackedState") != idle_sig:
+                            add_event({
+                                "id": f"thr:{tid}:{latest_id or 'empty'}:idle_timeout",
+                                "source": "thread",
+                                "kind": "thread_idle_timeout",
+                                "severity": "warning",
+                                "ts": time.time(),
+                                "threadId": tid,
+                                "provider": provider,
+                                "turnId": latest_id,
+                                "summary": f"Thread idle for {elapsed:.1f}s without new turn",
+                            })
+                            state["ackedState"] = idle_sig
+
+            async def watch_inboxes(bell: InboxDoorbell):
+                if scan_inboxes():
+                    return
+                while not wake_event.is_set():
+                    rem = remaining_time()
+                    if rem is not None and rem <= 0:
+                        return
+                    step = min(5.0, rem) if rem is not None else 5.0
+                    await bell.wait(timeout=step)
+                    if scan_inboxes():
+                        return
+
+            async def watch_provider_group(provider: str, group_rows: list[dict]):
+                disconnected_since: float | None = None
+                while not wake_event.is_set():
+                    rem = remaining_time()
+                    if rem is not None and rem <= 0:
+                        return
+                    try:
+                        ep = await self.runtime.endpoint(provider, start=False)
+                        async with ep.rpc() as c:
+                            while not wake_event.is_set():
+                                rem = remaining_time()
+                                if rem is not None and rem <= 0:
+                                    return
+                                for row in group_rows:
+                                    st = thread_states[row["id"]]
+                                    stop_at = None if st.get("_uninitialized") else st.get("baselineTurnId")
+                                    try:
+                                        turns = await self.recent_turns(
+                                            c, row["id"], stop_at=stop_at,
+                                            single_page=bool(st.get("_uninitialized")),
+                                        )
+                                    except RpcError as rpc_err:
+                                        err_sig = {"turnId": None, "status": "rpcError", "message": str(rpc_err)}
+                                        thread_snapshots[row["id"]] = {
+                                            "provider": provider,
+                                            "status": "error",
+                                            "latestTurnId": thread_snapshots.get(row["id"], {}).get("latestTurnId"),
+                                        }
+                                        if st.get("ackedState") != err_sig:
+                                            add_event({
+                                                "id": f"thr:{row['id']}:rpc_error:{key(str(rpc_err))[:8]}",
+                                                "source": "thread",
+                                                "kind": "thread_error",
+                                                "severity": "error",
+                                                "ts": time.time(),
+                                                "threadId": row["id"],
+                                                "provider": provider,
+                                                "summary": str(rpc_err),
+                                            })
+                                            st["ackedState"] = err_sig
+                                        continue
+                                    if disconnected_since is not None or st.get("disconnected"):
+                                        disconnected_since = None
+                                        if st.get("disconnected"):
+                                            st["disconnected"] = False
+                                            add_event({
+                                                "id": f"thr:{row['id']}:recovered:{int(time.time() * 1000)}",
+                                                "source": "thread",
+                                                "kind": "thread_recovered",
+                                                "severity": "info",
+                                                "ts": time.time(),
+                                                "threadId": row["id"],
+                                                "provider": provider,
+                                                "summary": f"Reconnected to {provider} endpoint",
+                                            })
+                                    evaluate_thread(row, turns, c.pending_requests, len(group_rows))
+                                if wake_event.is_set():
+                                    return
+                                wait_for_tick = poll_interval if rem is None else min(poll_interval, rem)
+                                if wait_for_tick <= 0:
+                                    return
+                                try:
+                                    await asyncio.wait_for(c.notifications.get(), timeout=wait_for_tick)
+                                    while not c.notifications.empty():
+                                        c.notifications.get_nowait()
+                                except asyncio.TimeoutError:
+                                    pass
+                    except (TransportError, RuntimeFailure, OSError) as error:
+                        now = time.monotonic()
+                        disconnected_since = disconnected_since or now
+                        if now - disconnected_since >= disconnect_grace:
+                            for row in group_rows:
+                                st = thread_states[row["id"]]
+                                thread_snapshots[row["id"]] = {
+                                    "provider": provider,
+                                    "status": "disconnected",
+                                    "latestTurnId": thread_snapshots.get(row["id"], {}).get("latestTurnId"),
+                                }
+                                if not st.get("disconnected"):
+                                    st["disconnected"] = True
+                                    add_event({
+                                        "id": f"thr:{row['id']}:disconnected:{int(disconnected_since * 1000)}",
+                                        "source": "thread",
+                                        "kind": "thread_disconnected",
+                                        "severity": "error",
+                                        "ts": time.time(),
+                                        "threadId": row["id"],
+                                        "provider": provider,
+                                        "summary": str(error),
+                                    })
+                            if wake_event.is_set():
+                                return
+                        rem = remaining_time()
+                        if rem is not None and rem <= 0:
+                            return
+                        await asyncio.sleep(min(poll_interval, rem) if rem is not None else poll_interval)
+
+            async with maybe_doorbell() as bell:
+                watcher_tasks: list[asyncio.Task] = []
+                if bell is not None:
+                    watcher_tasks.append(asyncio.create_task(watch_inboxes(bell), name="wait-inboxes"))
+                by_provider: dict[str, list[dict]] = {}
+                for row in unique_rows:
+                    by_provider.setdefault(row["modelProvider"], []).append(row)
+                for provider, group_rows in by_provider.items():
+                    watcher_tasks.append(asyncio.create_task(
+                        watch_provider_group(provider, group_rows), name=f"wait-provider-{provider}",
+                    ))
+                try:
+                    rem = remaining_time()
+                    if rem is None:
+                        await wake_event.wait()
+                    elif rem > 0:
+                        with suppress(asyncio.TimeoutError):
+                            await asyncio.wait_for(wake_event.wait(), timeout=rem)
+                    if wake_event.is_set() and channels:
+                        scan_inboxes()
+                finally:
+                    for task in watcher_tasks:
+                        task.cancel()
+                    for task in watcher_tasks:
+                        with suppress(asyncio.CancelledError):
+                            await task
+
+            for st in working_cursor["threads"].values():
+                st.pop("_uninitialized", None)
+
+            def commit():
+                if consumer and not no_advance and events:
+                    self.cursors.save_sync(consumer, working_cursor)
+
+            if events:
+                severities = {e.get("severity", "info") for e in events}
+                worst = "error" if "error" in severities else ("warning" if "warning" in severities else "info")
+                if commit_callbacks is not None:
+                    commit_callbacks.append(commit)
+                else:
+                    commit()
+                return {
+                    "status": "events",
+                    "worst": worst,
+                    "events": events,
+                    "threads": thread_snapshots,
+                    "cursor": {"consumer": consumer, "advanced": bool(consumer and not no_advance)},
+                }
+            return {
+                "status": "timeout",
+                "worst": "info",
+                "events": [],
+                "threads": thread_snapshots,
+                "cursor": {"consumer": consumer, "advanced": False},
+            }
 
     async def interrupt(self, row, turn_id=None):
         async with self.connection(row) as (_, c):

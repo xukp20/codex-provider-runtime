@@ -73,9 +73,15 @@ class Endpoint:
 
 
 class Runtime:
-    def __init__(self, home=None, binary=None, app_socket=None):
+    def __init__(self, home=None, binary=None, app_socket=None, *, require_binary: bool = True):
         self.home = Path(home or os.environ.get("CODEX_HOME") or Path.home()/".codex").expanduser().resolve()
-        self.binary = discover_binary(binary)
+        if require_binary:
+            self.binary = discover_binary(binary)
+        else:
+            try:
+                self.binary = discover_binary(binary)
+            except RuntimeFailure:
+                self.binary = binary or "codex"
         self.app_socket = str(app_socket or os.environ.get("CODEX_APP_SERVER_SOCKET") or self.home/"app-server-control"/"app-server-control.sock")
         self.state = private_dir(self.home/"provider-runtime")
         # Keep AF_UNIX paths short. This is transient machine-local state.

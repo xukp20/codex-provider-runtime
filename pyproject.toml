@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "codex-provider-runtime"
-version = "0.1.0"
+version = "0.2.0"
 description = "Local provider-isolated Codex App Servers and task communication"
 requires-python = ">=3.11"
 dependencies = ["websockets>=14,<17", "wsproto>=1.2,<2", "psutil>=6,<8"]

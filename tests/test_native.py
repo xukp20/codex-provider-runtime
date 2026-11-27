@@ -252,3 +252,35 @@ def test_native_empty_configuration_survives_owned_restart(native):
     assert resumed['model'] == 'gpt-6-astra' and resumed['effort'] == 'medium', resumed
     assert resumed['context'] == {'model_context_window': 100000}
     assert len(native.mock.requests) == 1, 'Explicit idle resume performed inference'
+
+
+def test_native_multi_wait_with_consumer_anchor_and_inbox(native):
+    t1 = native.create('Multi one', provider='fixture-a')
+    t2 = native.create('Multi two', provider='fixture-b')
+    # Anchor consumer via send on both threads across different providers
+    s1 = native.call('send', '--thread', t1['threadId'], '--message', 'SHORT', '--consumer', 'native-agy')
+    s2 = native.call('send', '--thread', t2['threadId'], '--message', 'SHORT', '--consumer', 'native-agy')
+    assert s1['consumerAnchored'] == 'native-agy' and s2['consumerAnchored'] == 'native-agy'
+    # Push a structured inbox escalation simultaneously
+    pushed = native.call('inbox', 'push', '--channel', 'native-ch', '--kind', 'milestone',
+                         '--summary', 'stage 1 ready', '--thread', t1['threadId'], '--request-id', 'native-inbox-1')
+    assert pushed['seq'] == 1
+    # Unified wait catches events across threads and inbox with exit 0
+    seen_sources = set()
+    seen_threads = set()
+    for _ in range(3):
+        ev_pack = native.call('wait', '--thread', t1['threadId'], '--thread', t2['threadId'],
+                              '--inbox', 'native-ch', '--consumer', 'native-agy', '--timeout', '10')
+        assert ev_pack['status'] == 'events'
+        for ev in ev_pack['events']:
+            seen_sources.add(ev['source'])
+            if ev.get('source') == 'thread':
+                seen_threads.add(ev['threadId'])
+        if {'inbox', 'thread'} <= seen_sources and {t1['threadId'], t2['threadId']} <= seen_threads:
+            break
+    assert {'inbox', 'thread'} <= seen_sources
+    assert {t1['threadId'], t2['threadId']} <= seen_threads
+    # Re-arming after drain times out cleanly with exit 5 (no duplicate wakeups)
+    timed_out = native.call('wait', '--thread', t1['threadId'], '--thread', t2['threadId'],
+                            '--inbox', 'native-ch', '--consumer', 'native-agy', '--timeout', '0.3', expected=5)
+    assert timed_out['status'] == 'timeout'
